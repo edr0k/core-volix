@@ -1,11 +1,11 @@
+import json  # <--- IMPORTANTE: Adicione este import no topo
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
-from pydantic import Json
 import pandas as pd
 import io
 import logging
 
-# Importa seus schemas e serviços já criados
+# Importa seus schemas e serviços
 from .schemas import PayloadEntrada, ConfigPrevisao, ColunasMapping
 from .services import PrevisaoService
 
@@ -16,25 +16,38 @@ logger = logging.getLogger(__name__)
 
 @app.post("/v1/previsao/arquivo")
 async def processar_arquivo(
-    # 1. O Arquivo (Excel ou Parquet)
+    # 1. O Arquivo
     arquivo: UploadFile = File(..., description="Arquivo histórico (.xlsx ou .parquet)"),
     
-    # 2. As Configurações (Vêm como JSON string dentro do formulário)
-    # No Swagger, aparecerá um campo texto para colar o JSON da config
-    config: Json[ConfigPrevisao] = Form(..., description='JSON de configuração: {"horizonte": 3, "regra_corte": true}'),
-    mapeamento: Json[ColunasMapping] = Form(..., description='JSON de mapeamento: {"data": "dt_ref", "volume": "qtd", "agrupamento": ["produto"]}'),
+    # 2. As Configurações (Recebemos como TEXTO PURO para evitar erro 422)
+    config: str = Form(..., description='JSON string de configuração'),
+    mapeamento: str = Form(..., description='JSON string de mapeamento'),
     
-    # 3. Formato de Saída (Opcional)
+    # 3. Formato de Saída
     formato_saida: str = Form("excel", enum=["excel", "parquet"], description="Formato do arquivo de resposta")
 ):
     """
-    Recebe um arquivo (Excel/Parquet) e retorna as previsões no formato solicitado.
+    Recebe um arquivo (Excel/Parquet) e retorna as previsões.
     """
     try:
+        # --- A. PARSE MANUAL DOS JSONs (A Mágica da correção) ---
+        # Convertemos a string que veio do formulário em dicionário Python
+        try:
+            config_dict = json.loads(config)
+            map_dict = json.loads(mapeamento)
+            
+            # Valida os dados usando seus Schemas Pydantic
+            config_obj = ConfigPrevisao(**config_dict)
+            map_obj = ColunasMapping(**map_dict)
+            
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="O JSON de configuração ou mapeamento está inválido (erro de sintaxe).")
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Erro de validação nos parâmetros: {str(e)}")
+
         logger.info(f"Recebendo arquivo: {arquivo.filename}")
 
-        # --- A. LER O ARQUIVO ---
-        # Detecta a extensão para usar o leitor correto do Pandas
+        # --- B. LER O ARQUIVO ---
         filename = arquivo.filename.lower()
         contents = await arquivo.read()
         buffer_entrada = io.BytesIO(contents)
@@ -49,11 +62,11 @@ async def processar_arquivo(
         if df_entrada.empty:
             raise HTTPException(status_code=400, detail="O arquivo enviado está vazio.")
 
-        # --- B. PROCESSAR (Usa o mesmo Service de antes!) ---
+        # --- C. PROCESSAR ---
         servico = PrevisaoService(
             df=df_entrada,
-            mapeamento=mapeamento,
-            config=config
+            mapeamento=map_obj,   # Passamos o objeto já validado
+            config=config_obj     # Passamos o objeto já validado
         )
         
         df_resultado = servico.executar()
@@ -61,11 +74,10 @@ async def processar_arquivo(
         if df_resultado.empty:
             return {"status": "warning", "message": "Nenhuma previsão gerada (dados insuficientes)."}
 
-        # --- C. GERAR ARQUIVO DE SAÍDA ---
+        # --- D. GERAR ARQUIVO DE SAÍDA ---
         buffer_saida = io.BytesIO()
 
         if formato_saida == "excel":
-            # Salva como Excel em memória
             with pd.ExcelWriter(buffer_saida, engine='xlsxwriter') as writer:
                 df_resultado.to_excel(writer, index=False, sheet_name='Previsao')
             
@@ -77,15 +89,16 @@ async def processar_arquivo(
             media_type = "application/octet-stream"
             filename_out = "previsao_resultado.parquet"
 
-        buffer_saida.seek(0) # Volta o ponteiro para o início do arquivo
+        buffer_saida.seek(0)
 
-        # Retorna o arquivo como download
         return StreamingResponse(
             buffer_saida,
             media_type=media_type,
             headers={"Content-Disposition": f"attachment; filename={filename_out}"}
         )
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.error(f"Erro no processamento: {e}")
         raise HTTPException(status_code=500, detail=str(e))
